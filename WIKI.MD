@@ -77,6 +77,7 @@ Please see https://github.com/HavocFramework/Havoc/issues/95.
 #### `Known compiler issue: [-] Couldn't compile implant: exit status 1`
 
 Please see https://github.com/HavocFramework/Havoc/issues/105.
+
 ---
 
 ## <a name="install"></a>Installation
