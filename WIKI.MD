@@ -75,6 +75,7 @@ You probably need a newer version of Qt. If you are using Ubuntu try adding a ba
 Please see https://github.com/HavocFramework/Havoc/issues/95.
 
 #### `Known compiler issue: [-] Couldn't compile implant: exit status 1`
+
 Please see https://github.com/HavocFramework/Havoc/issues/105.
 ---
 
