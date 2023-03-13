@@ -2,6 +2,9 @@ package teamserver
 
 import "C"
 import (
+	"Havoc/pkg/agent"
+	"Havoc/pkg/db"
+	"Havoc/pkg/webhook"
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
@@ -32,8 +35,6 @@ import (
 
 // maybe move this to cmd
 
-var HavocTeamserver *Teamserver
-
 func NewTeamserver() *Teamserver {
 	return new(Teamserver)
 }
@@ -45,9 +46,16 @@ func (t *Teamserver) SetServerFlags(flags TeamserverFlags) {
 func (t *Teamserver) Start() {
 	logger.Debug("Starting teamserver...")
 	var (
-		ServerFinished chan bool
-		TeamserverWs   string
+		ServerFinished      chan bool
+		TeamserverWs        string
+		TeamserverPath, err = os.Getwd()
+		ListenerCount       int
 	)
+
+	if err != nil {
+		logger.Error("Couldn't get the current directory: " + err.Error())
+		return
+	}
 
 	if t.Flags.Server.Host == "" {
 		t.Flags.Server.Host = t.Profile.ServerHost()
@@ -57,7 +65,6 @@ func (t *Teamserver) Start() {
 		t.Flags.Server.Port = strconv.Itoa(t.Profile.ServerPort())
 	}
 
-	// ------- WebSocket Server implementation -------
 	gin.SetMode(gin.ReleaseMode)
 	t.Server.Engine = gin.New()
 
@@ -117,7 +124,7 @@ func (t *Teamserver) Start() {
 		os.Exit(0)
 	}(t.Flags.Server.Host + ":" + t.Flags.Server.Port)
 
-	// -------
+	t.WebHooks = webhook.NewWebHook()
 	t.Service = service.NewService(t.Server.Engine)
 	t.Service.Events = t
 	t.Service.TeamAgents = &t.Agents
@@ -127,6 +134,32 @@ func (t *Teamserver) Start() {
 	t.Service.Data.ServerAgents = &t.Agents
 
 	logger.Info("Starting Teamserver on " + colors.BlueUnderline(TeamserverWs))
+
+	/* if we specified a webhook then lets use it. */
+	if t.Profile.Config.WebHook != nil {
+
+		if t.Profile.Config.WebHook.Discord != nil {
+
+			var (
+				AvatarUrl string
+				UserName  string
+			)
+
+			if len(t.Profile.Config.WebHook.Discord.AvatarUrl) > 0 {
+				AvatarUrl = t.Profile.Config.WebHook.Discord.AvatarUrl
+			}
+
+			if len(t.Profile.Config.WebHook.Discord.UserName) > 0 {
+				UserName = t.Profile.Config.WebHook.Discord.UserName
+			}
+
+			if len(t.Profile.Config.WebHook.Discord.WebHook) > 0 {
+				t.WebHooks.SetDiscord(AvatarUrl, UserName, t.Profile.Config.WebHook.Discord.WebHook)
+			}
+
+		}
+
+	}
 
 	// start teamserver service
 	if t.Profile.Config.Service != nil {
@@ -140,10 +173,25 @@ func (t *Teamserver) Start() {
 		}
 	}
 
-	// start all listeners
+	/* now load up our db or start a new one if none exist */
+	if t.DB, err = db.DatabaseNew(TeamserverPath + "/data/havoc.db"); err != nil {
+		logger.SetStdOut(os.Stderr)
+		logger.Error("Failed to create or open a database: " + err.Error())
+		return
+	}
+
+	if t.DB.Existed() {
+		logger.Info("Opens existing database: " + colors.Blue("data/havoc.db"))
+	} else {
+		logger.Info("Creates new database: " + colors.Blue("data/havoc.db"))
+	}
+
+	ListenerCount = t.DB.ListenerCount()
+
+	/* start listeners from the specified yaotl profile */
 	if t.Profile.Config.Listener != nil {
 
-		// Start all HTTP/s listeners
+		/* Start all HTTP/s listeners */
 		for _, listener := range t.Profile.Config.Listener.ListenerHTTP {
 			var HandlerData = handlers.HTTPConfig{
 				Name:         listener.Name,
@@ -157,17 +205,37 @@ func (t *Teamserver) Start() {
 				Secure:       listener.Secure,
 			}
 
+			if listener.Cert != nil {
+				var Found = true
+
+				if _, err = os.Stat(listener.Cert.Cert); !os.IsNotExist(err) {
+					HandlerData.Cert.Cert = listener.Cert.Cert
+				} else {
+					Found = false
+				}
+
+				if _, err = os.Stat(listener.Cert.Key); !os.IsNotExist(err) {
+					HandlerData.Cert.Key = listener.Cert.Key
+				} else {
+					Found = false
+				}
+
+				if !Found {
+					logger.Error("Failed to find Cert/Key Path for listener '" + listener.Name + "'. Using randomly generated certs")
+				}
+			}
+
 			if listener.Response != nil {
 				HandlerData.Response.Headers = listener.Response.Headers
 			}
 
 			if err := t.ListenerStart(handlers.LISTENER_HTTP, HandlerData); err != nil {
-				logger.Error("Failed to start listener: " + err.Error())
+				logger.Error("Failed to start listener from profile: " + err.Error())
 				return
 			}
 		}
 
-		// Start all SMB listeners
+		/* Start all SMB listeners */
 		for _, listener := range t.Profile.Config.Listener.ListenerSMB {
 			var HandlerData = handlers.SMBConfig{
 				Name:     listener.Name,
@@ -175,12 +243,12 @@ func (t *Teamserver) Start() {
 			}
 
 			if err := t.ListenerStart(handlers.LISTENER_PIVOT_SMB, HandlerData); err != nil {
-				logger.Error("Failed to start listener: " + err.Error())
+				logger.Error("Failed to start listener from profile: " + err.Error())
 				return
 			}
 		}
 
-		// Start all ExternalC2 listeners
+		/* Start all ExternalC2 listeners */
 		for _, listener := range t.Profile.Config.Listener.ListenerExternal {
 			var HandlerData = handlers.ExternalConfig{
 				Name:     listener.Name,
@@ -188,9 +256,149 @@ func (t *Teamserver) Start() {
 			}
 
 			if err := t.ListenerStart(handlers.LISTENER_EXTERNAL, HandlerData); err != nil {
-				logger.Error("Failed to start listener: " + err.Error())
+				logger.Error("Failed to start listener from profile: " + err.Error())
 				return
 			}
+		}
+
+	}
+
+	if ListenerCount > 0 {
+
+		var TotalCount = 0
+
+		if DbName := t.DB.ListenerNames(); len(DbName) > 0 {
+
+			TotalCount = ListenerCount
+
+			for _, name := range DbName {
+
+				for _, listener := range t.Listeners {
+
+					if listener.Name == name {
+						TotalCount--
+						break
+					}
+
+				}
+
+			}
+
+		}
+
+		if TotalCount > 0 {
+			logger.Info(fmt.Sprintf("Starting %v listeners from last session", colors.Green(TotalCount)))
+		}
+	}
+
+	for _, listener := range t.DB.ListenerAll() {
+
+		switch listener["Protocol"] {
+
+		case handlers.AGENT_HTTP, handlers.AGENT_HTTPS:
+
+			var (
+				Data        = make(map[string]any)
+				HandlerData = handlers.HTTPConfig{
+					Name: listener["Name"],
+				}
+			)
+
+			err = json.Unmarshal([]byte(listener["Config"]), &Data)
+			if err != nil {
+				logger.Error("Failed to unmarshal json bytes to map: " + err.Error())
+				continue
+			}
+
+			/* set config of http listener */
+			HandlerData.Hosts = strings.Split(Data["Hosts"].(string), ", ")
+			HandlerData.HostBind = Data["HostBind"].(string)
+			HandlerData.HostRotation = Data["HostRotation"].(string)
+			HandlerData.Port = Data["Port"].(string)
+			HandlerData.UserAgent = Data["UserAgent"].(string)
+			HandlerData.Headers = strings.Split(Data["Headers"].(string), ", ")
+			HandlerData.Uris = strings.Split(Data["Uris"].(string), ", ")
+
+			HandlerData.Secure = false
+			if Data["Secure"].(string) == "true" {
+				HandlerData.Secure = true
+			}
+
+			if Data["Response Headers"] != nil {
+
+				switch Data["Response Headers"].(type) {
+
+				case string:
+					HandlerData.Response.Headers = strings.Split(Data["Response Headers"].(string), ", ")
+					break
+
+				default:
+					for _, s := range Data["Response Headers"].([]interface{}) {
+						HandlerData.Response.Headers = append(HandlerData.Response.Headers, s.(string))
+					}
+
+				}
+			}
+
+			/* also ignore if we already have a listener running */
+			if err := t.ListenerStart(handlers.LISTENER_HTTP, HandlerData); err != nil && err.Error() != "listener already exists" {
+				logger.SetStdOut(os.Stderr)
+				logger.Error("Failed to start listener from db: " + err.Error())
+				return
+			}
+
+			break
+
+		case handlers.AGENT_EXTERNAL:
+
+			var (
+				Data        = make(map[string]any)
+				HandlerData = handlers.ExternalConfig{
+					Name: listener["Name"],
+				}
+			)
+
+			err := json.Unmarshal([]byte(listener["Config"]), &Data)
+			if err != nil {
+				logger.Debug("Failed to unmarshal json bytes to map: " + err.Error())
+				continue
+			}
+
+			HandlerData.Endpoint = Data["Endpoint"].(string)
+
+			if err := t.ListenerStart(handlers.LISTENER_EXTERNAL, HandlerData); err != nil && err.Error() != "listener already exists" {
+				logger.SetStdOut(os.Stderr)
+				logger.Error("Failed to start listener from db: " + err.Error())
+				return
+			}
+
+			break
+
+		case handlers.AGENT_PIVOT_SMB:
+
+			var (
+				Data        = make(map[string]any)
+				HandlerData = handlers.SMBConfig{
+					Name: listener["Name"],
+				}
+			)
+
+			err := json.Unmarshal([]byte(listener["Config"]), &Data)
+			if err != nil {
+				logger.Debug("Failed to unmarshal json bytes to map: " + err.Error())
+				continue
+			}
+
+			HandlerData.PipeName = Data["PipeName"].(string)
+
+			if err := t.ListenerStart(handlers.LISTENER_PIVOT_SMB, HandlerData); err != nil && err.Error() != "listener already exists" {
+				logger.SetStdOut(os.Stderr)
+				logger.Error("Failed to start listener from db: " + err.Error())
+				return
+			}
+
+			break
+
 		}
 
 	}
@@ -252,7 +460,7 @@ func (t *Teamserver) handleRequest(id string) {
 		if t.Clients[id] == nil {
 			return
 		}
-		logger.Error("Client (" + id + ") User (" + pk.Body.Info["User"].(string) + ") failed to Authenticate! (" + colors.Red(t.Clients[id].GlobalIP) + ")")
+		logger.Error("Client [User: " + pk.Body.Info["User"].(string) + "] failed to Authenticate! (" + colors.Red(t.Clients[id].GlobalIP) + ")")
 		err := t.SendEvent(id, events.Authenticated(false))
 		if err != nil {
 			logger.Error("client (" + colors.Red(id) + ") error while sending authenticate message: " + colors.Red(err))
@@ -388,6 +596,38 @@ func (t *Teamserver) EventBroadcast(ExceptClient string, pk packager.Package) {
 	}
 }
 
+func (t *Teamserver) EventNewDemon(DemonAgent *agent.Agent) packager.Package {
+	return events.Demons.NewDemon(DemonAgent)
+}
+
+func (t *Teamserver) EventAgentMark(AgentID, Mark string) {
+	var pk = events.Demons.MarkAs(AgentID, Mark)
+
+	t.EventAppend(pk)
+	t.EventBroadcast("", pk)
+}
+
+func (t *Teamserver) EventListenerError(ListenerName string, Error error) {
+	var pk = events.Listener.ListenerError("", ListenerName, Error)
+
+	t.EventAppend(pk)
+	t.EventBroadcast("", pk)
+
+	// also remove the listener from the init packages.
+	for EventID := range t.EventsList {
+		if t.EventsList[EventID].Head.Event == packager.Type.Listener.Type {
+			if t.EventsList[EventID].Body.SubEvent == packager.Type.Listener.Add {
+				if name, ok := t.EventsList[EventID].Body.Info["Name"]; ok {
+					if name == ListenerName {
+						t.EventsList[EventID].Body.Info["Status"] = "Offline"
+						t.EventsList[EventID].Body.Info["Error"] = Error.Error()
+					}
+				}
+			}
+		}
+	}
+}
+
 func (t *Teamserver) SendEvent(id string, pk packager.Package) error {
 	var (
 		buffer bytes.Buffer
@@ -402,12 +642,14 @@ func (t *Teamserver) SendEvent(id string, pk packager.Package) error {
 	if t.Clients[id] != nil {
 
 		t.Clients[id].Mutex.Lock()
-		defer t.Clients[id].Mutex.Unlock()
 
 		err = t.Clients[id].Connection.WriteMessage(websocket.BinaryMessage, buffer.Bytes())
 		if err != nil {
+			t.Clients[id].Mutex.Unlock()
 			return err
 		}
+
+		t.Clients[id].Mutex.Unlock()
 
 	} else {
 		return errors.New(fmt.Sprintf("client (%v) doesn't exist anymore", colors.Red(id)))
@@ -472,7 +714,7 @@ func (t *Teamserver) FindSystemPackages() bool {
 		if len(t.Profile.Config.Server.Build.Compiler64) > 0 {
 			if _, err := os.Stat(t.Profile.Config.Server.Build.Compiler64); os.IsNotExist(err) {
 				logger.SetStdOut(os.Stderr)
-				logger.Error("Compiler x64 path doesn't exists: " + t.Profile.Config.Server.Build.Compiler64)
+				logger.Error("Compiler x64 path doesn't exist: " + t.Profile.Config.Server.Build.Compiler64)
 				return false
 			}
 
@@ -489,7 +731,7 @@ func (t *Teamserver) FindSystemPackages() bool {
 		if len(t.Profile.Config.Server.Build.Compiler86) > 0 {
 			if _, err := os.Stat(t.Profile.Config.Server.Build.Compiler86); os.IsNotExist(err) {
 				logger.SetStdOut(os.Stderr)
-				logger.Error("Compiler x86 path doesn't exists: " + t.Profile.Config.Server.Build.Compiler86)
+				logger.Error("Compiler x86 path doesn't exist: " + t.Profile.Config.Server.Build.Compiler86)
 				return false
 			}
 
@@ -506,7 +748,7 @@ func (t *Teamserver) FindSystemPackages() bool {
 		if len(t.Profile.Config.Server.Build.Nasm) > 0 {
 			if _, err := os.Stat(t.Profile.Config.Server.Build.Nasm); os.IsNotExist(err) {
 				logger.SetStdOut(os.Stderr)
-				logger.Error("Nasm path doesn't exists: " + t.Profile.Config.Server.Build.Nasm)
+				logger.Error("Nasm path doesn't exist: " + t.Profile.Config.Server.Build.Nasm)
 				return false
 			}
 

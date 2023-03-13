@@ -229,7 +229,7 @@ HavocNamespace::UserInterface::Dialogs::NewListener::NewListener( QDialog* Dialo
     formLayout_3->setWidget( 4, QFormLayout::LabelRole, LabelPassword );
     formLayout_3->setWidget( 4, QFormLayout::FieldRole, InputPassword );
 
-    ComboHostBind->addItems( HavocX::Teamserver.IpAddresses );
+    ComboHostBind->addItems( QStringList() << HavocX::Teamserver.IpAddresses << "127.0.0.1" << "0.0.0.0" );
 
     CheckEnableProxy->setObjectName( "bool" );
     ProxyConfigBox->setEnabled( true );
@@ -520,10 +520,13 @@ map<string, string> HavocNamespace::UserInterface::Dialogs::NewListener::Start( 
 
         if ( ( Item.Protocol == Listener::PayloadHTTP.toStdString() ) || ( Item.Protocol == Listener::PayloadHTTPS.toStdString() ) )
         {
-            if ( Item.Protocol == Listener::PayloadHTTP.toStdString() )
+            if ( Item.Protocol == Listener::PayloadHTTPS.toStdString() ) {
                 ComboPayload->setCurrentIndex( 0 );
-            else
+            }
+            else {
                 ComboPayload->setCurrentIndex( 1 );
+            }
+
             ComboPayload->setDisabled( true );
 
             auto Info = any_cast<Listener::HTTP>( Item.Info );

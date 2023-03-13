@@ -1,19 +1,39 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required( VERSION 3.15 )
 project( Havoc )
 
-set(CMAKE_CXX_STANDARD 20)
+set( CMAKE_CXX_STANDARD 20 )
 
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-set(CMAKE_AUTOUIC ON)
+set( CMAKE_AUTOMOC ON )
+set( CMAKE_AUTORCC ON )
+set( CMAKE_AUTOUIC ON )
 
-set(CMAKE_CPP_COMPILER /usr/bin/x86_64-w64-mingw32-g++)
-set(CMAKE_C_COMPILER /usr/bin/x86_64-w64-mingw32-gcc)
-set(CMAKE_CXX_FLAGS "-fpermissive")
+set( CMAKE_CPP_COMPILER /usr/bin/x86_64-w64-mingw32-g++ )
+set( CMAKE_C_COMPILER /usr/bin/x86_64-w64-mingw32-gcc )
+set( CMAKE_CXX_FLAGS "-fpermissive" )
 
 set( QT_VERSION 5 )
 set( REQUIRED_LIBS Core Gui Widgets Network WebSockets Sql )
 set( REQUIRED_LIBS_QUALIFIED Qt5::Core Qt5::Gui Qt5::Widgets Qt5::Network Qt5::WebSockets Qt5::Sql )
+
+# Ensure 3.10 is used if present. If not, modules will not work within the client.
+set( Python_ADDITIONAL_VERSIONS 3.10 )
+
+if(APPLE)
+  find_package(Python 3 COMPONENTS Interpreter Development REQUIRED)
+  set(PYTHON_MAJOR $ENV{Python_VERSION_MAJOR})
+  set(PYTHON_MINOR $ENV{Python_VERSION_MINOR})
+  set(PYTHONLIBS_VERSION_STRING ${Python_VERSION})
+  set(PYTHON_INCLUDE_DIR ${Python_INCLUDE_DIRS})
+  set(PYTHON_LIBRARIES ${Python_LIBRARIES})
+  message("Apple - Using Python:${Python_VERSION_MAJOR} - Libraries:${PYTHON_LIBRARIES} - IncludeDirs: ${PYTHON_INCLUDE_DIR}")
+elseif(UNIX)
+  find_package(PythonLibs 3 REQUIRED)
+else()
+  set(PYTHONLIBS_VERSION_STRING $ENV{PY_VERSION})
+endif()
+
+find_package( spdlog REQUIRED )
+find_package( Qt${QT_VERSION} COMPONENTS ${REQUIRED_LIBS} REQUIRED )
 
 include_directories( Include )
 
@@ -23,7 +43,7 @@ if(APPLE)
     include_directories( "${BREW_PREFIX}/bin/python3.10" )
     include_directories( "${BREW_PREFIX}/Frameworks/Python.framework/Headers" )
 elseif(UNIX)
-    include_directories( "/usr/include/python3.10" )
+    include_directories( ${PYTHON_INCLUDE_DIRS} )
 endif()
 
 set( APP_ICON_RESOURCE_WINDOWS "Data/Havoc.qrc" )
@@ -42,6 +62,7 @@ set(
         Include/Havoc/Packager.hpp
         Include/Havoc/Havoc.hpp
         Include/Havoc/Service.hpp
+        Include/Havoc/CmdLine.hpp
 
         # Python Api
         Include/Havoc/PythonApi/PythonApi.h
@@ -115,7 +136,6 @@ set(
 
         Source/Util/ColorText.cpp
         Source/Util/Base64.cpp
-        Source/Util/StructPack/struct.cpp
         Source/Util/Base.cpp
 )
 
@@ -151,7 +171,7 @@ set(
         Source/Havoc/Havoc.cpp
 
         ${HAVOC_UI}
-)
+        Include/Havoc/PythonApi/PyAgentClass.hpp Source/Havoc/PythonApi/PyAgentClass.cpp)
 
 add_executable( ${PROJECT_NAME} ${HAVOC_INCLUDE} ${HAVOC_SOURCE} ${HAVOC_UTIL} ${APP_ICON_RESOURCE_WINDOWS} Data/Havoc.rc )
 add_definitions( -DQT_NO_DEBUG_OUTPUT )
@@ -161,25 +181,6 @@ add_definitions( -DQT_NO_DEBUG_OUTPUT )
 # set(Boost_USE_STATIC_RUNTIME OFF)
 # find_package(Boost COMPONENTS program_options python)
 # include_directories(${Boost_INCLUDE_DIRS})
-
-set( Python_ADDITIONAL_VERSIONS )
-
-if(APPLE)
-  find_package(Python 3 COMPONENTS Interpreter Development REQUIRED)
-  set(PYTHON_MAJOR $ENV{Python_VERSION_MAJOR})
-  set(PYTHON_MINOR $ENV{Python_VERSION_MINOR})
-  set(PYTHONLIBS_VERSION_STRING ${Python_VERSION})
-  set(PYTHON_INCLUDE_DIR ${Python_INCLUDE_DIRS})
-  set(PYTHON_LIBRARIES ${Python_LIBRARIES})
-  message("Apple - Using Python:${Python_VERSION_MAJOR} - Libraries:${PYTHON_LIBRARIES} - IncludeDirs: ${PYTHON_INCLUDE_DIR}")
-elseif(UNIX)
-  find_package(PythonLibs 3 REQUIRED)
-else()
-  set(PYTHONLIBS_VERSION_STRING $ENV{PY_VERSION})
-endif()
-
-find_package( spdlog REQUIRED )
-find_package( Qt${QT_VERSION} COMPONENTS ${REQUIRED_LIBS} REQUIRED )
 
 target_link_libraries(
         ${PROJECT_NAME}

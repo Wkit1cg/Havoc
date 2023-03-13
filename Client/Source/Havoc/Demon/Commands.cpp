@@ -6,7 +6,7 @@
 #define BEHAVIOR_API_ONLY           "API Only"
 #define BEHAVIOR_TEAMSERVER         "Teamserver side"
 
-#define NO_SUBCOMMANDS  .SubCommands = { { nullptr } },
+#define NO_SUBCOMMANDS  .Module = false,
 
 using namespace HavocNamespace::HavocSpace;
 
@@ -16,6 +16,7 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
             .Description    = "Shows help message of specified command",
             .Usage          = "[command]",
             .Example        = "inline-execute",
+            NO_SUBCOMMANDS
         },
         {
             .CommandString  = "sleep",
@@ -23,14 +24,18 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
             .MitreTechniques= { "T1029" },
             .Usage          = "[delay]",
             .Example        = "10",
+            NO_SUBCOMMANDS
         },
         {
             .CommandString  = "checkin",
             .Description    = "request a checkin request",
+            NO_SUBCOMMANDS
         },
         {
             .CommandString  = "job",
             .Description    = "job manager",
+            .Module         = true,
+
             .SubCommands    =
             {
                 {
@@ -64,6 +69,8 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
         {
             .CommandString  = "task",
             .Description    = "task manager",
+            .Module         = true,
+
             .SubCommands    =
             {
                 {
@@ -83,6 +90,7 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
             .Description    = "process enumeration and management",
             .Usage          = "[command]",
             .Example        = "list",
+            .Module         = true,
 
             .SubCommands    =
             {
@@ -99,14 +107,6 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
                     .MitreTechniques= { "T1057" },
                     .Usage          = "[pid]",
                     .Example        = "1337",
-                },
-                {
-                    .CommandString  = "blockdll",
-                    .Description    = "block non microsoft signed dlls",
-                    .Behavior       = BEHAVIOR_API_ONLY,
-                    .MitreTechniques = { },
-                    .Usage          = "[on/off]",
-                    .Example        = "on",
                 },
                 {
                     .CommandString  = "create",
@@ -141,6 +141,44 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
                     .Example        = "1337 PAGE_EXECUTE_READWRITE",
                 },
             },
+        },
+        {
+            .CommandString  = "transfer",
+            .Description    = "download transfer module",
+            .Behavior       = BEHAVIOR_API_ONLY,
+            .Usage          = "<subcommand>",
+            .Example        = "list",
+            .SubCommands    =
+            {
+                {
+                    .CommandString  = "list",
+                    .Description    = "list current downloads",
+                    .Behavior       = BEHAVIOR_API_ONLY,
+                    .Usage          = "",
+                    .Example        = "",
+                },
+                {
+                    .CommandString  = "stop",
+                    .Description    = "stops a download",
+                    .Behavior       = BEHAVIOR_API_ONLY,
+                    .Usage          = "<FileID>",
+                    .Example        = "ffff",
+                },
+                {
+                    .CommandString  = "resume",
+                    .Description    = "resumes a download",
+                    .Behavior       = BEHAVIOR_API_ONLY,
+                    .Usage          = "<FileID>",
+                    .Example        = "ffff",
+                },
+                {
+                    .CommandString  = "remove",
+                    .Description    = "stops and removes a download",
+                    .Behavior       = BEHAVIOR_API_ONLY,
+                    .Usage          = "<FileID>",
+                    .Example        = "ffff",
+                },
+            }
         },
         {
             .CommandString  = "dir",
@@ -249,6 +287,8 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
             .Description    = "shellcode injection techniques",
             .Usage          = "[subcommand]",
             .Example        = R"(inject-sys x64 1337 /tmp/rev_shell.x64.bin)",
+            .Module         = true,
+
             .SubCommands    =
             {
                 {
@@ -286,6 +326,7 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
             .Description    = "dll spawn and injection modules",
             .Usage          = "[subcommand]",
             .Example        = R"(inject 1337 /tmp/module.dll argument)",
+            .Module         = true,
 
             .SubCommands    =
             {
@@ -321,6 +362,7 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
             .Description    = "token manipulation and impersonation",
             .Usage          = "[subcommand]",
             .Example        = R"(steal 1337)",
+            .Module         = true,
 
             .SubCommands    =
             {
@@ -361,12 +403,6 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
                     .Example        = "domain.local Administrator Passw0rd@1234",
                 },
                 {
-                    .CommandString  = "privs-get",
-                    .Description    = "try to enable all/specified privileges from current token",
-                    .Behavior       = BEHAVIOR_API_ONLY,
-                    .MitreTechniques = { "T1134" },
-                },
-                {
                     .CommandString  = "privs-list",
                     .Description    = "list all privileges from current token",
                     .Behavior       = BEHAVIOR_API_ONLY,
@@ -398,6 +434,7 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
             .Behavior       = BEHAVIOR_API_ONLY,
             .Usage          = "[sub command]",
             .Example        = R"(inline-execute /tmp/seatbelt.exe)",
+            .Module         = true,
 
             .SubCommands    =
             {
@@ -422,6 +459,7 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
             .Behavior       = BEHAVIOR_API_ONLY,
             .Usage          = "[sub command] (args)",
             .Example        = R"(domain)",
+            .Module         = true,
 
             .SubCommands    =
             {
@@ -493,6 +531,7 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
             .Description    = "configure the behaviour of the demon session",
             .Usage          = "[config.flag]",
             .Example        = R"(inject.spawn64 C:\Windows\System32\rundll32.exe)",
+            .Module         = true,
 
             .SubCommands    =
             {
@@ -577,6 +616,7 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
             .Behavior       = BEHAVIOR_API_ONLY,
             .Usage          = "[sub command]",
             .Example        = R"(connect SPIDERS-PC agent_6d6e)",
+            .Module         = true,
 
             .SubCommands    =
             {
@@ -600,5 +640,75 @@ std::vector<DemonCommands::Command_t> DemonCommands::DemonCommandList = {
                     .Example        = R"(64656d6e)",
                 },
             },
-        }
+        },
+        {
+            .CommandString  = "rportfwd",
+            .Description    = "reverse port forwarding",
+            .Usage          = "[sub command] (args)",
+            .Example        = "add 0.0.0.0 8080 192.157.0.1 4444",
+            .Module         = true,
+            
+            .SubCommands    =
+            {
+                {
+                    .CommandString  = "add",
+                    .Description    = "add an reverse port forward",
+                    .Behavior       = BEHAVIOR_API_ONLY,
+                    .Usage          = "[bind host] [bind port] [forward host] [forward port]",
+                    .Example        = "0.0.0.0 8080 192.157.0.1 4444",
+                },
+                {
+                    .CommandString  = "list",
+                    .Description    = "list all reverse port forwards",
+                    .Behavior       = BEHAVIOR_API_ONLY,
+                },
+                {
+                    .CommandString  = "remove",
+                    .Description    = "close and remove a reverse port forward",
+                    .Behavior       = BEHAVIOR_API_ONLY,
+                    .Usage          = "[Socket ID]",
+                    .Example        = R"(b4bbb42)",
+                },
+                {
+                    .CommandString  = "clear",
+                    .Description    = "close and clear all reverse port forwards",
+                    .Behavior       = BEHAVIOR_API_ONLY,
+                },
+            },
+        },
+        {
+            .CommandString  = "socks",
+            .Description    = "socks4a proxy",
+            .Usage          = "[sub command] (args)",
+            .Example        = "add 4444",
+            .Module         = true,
+
+            .SubCommands    =
+                {
+                    {
+                        .CommandString  = "add",
+                        .Description    = "add a socks4a proxy",
+                        .Behavior       = BEHAVIOR_API_ONLY,
+                        .Usage          = "[bind port]",
+                        .Example        = "4444",
+                    },
+                    {
+                        .CommandString  = "list",
+                        .Description    = "list all socks4a proxy servers",
+                        .Behavior       = BEHAVIOR_API_ONLY,
+                    },
+                    {
+                        .CommandString  = "kill",
+                        .Description    = "kill and remove a socks4a proxy server",
+                        .Behavior       = BEHAVIOR_API_ONLY,
+                        .Usage          = "[bind port]",
+                        .Example        = R"(4444)",
+                    },
+                    {
+                        .CommandString  = "clear",
+                        .Description    = "kill and clear all socks4a proxy servers",
+                        .Behavior       = BEHAVIOR_API_ONLY,
+                    },
+                },
+        },
 };
